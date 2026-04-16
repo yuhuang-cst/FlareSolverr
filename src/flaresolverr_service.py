@@ -1,16 +1,11 @@
-import asyncio
 import base64
 import logging
-import os
 import platform
 import sys
 import time
 from datetime import timedelta
 from html import escape
 from urllib.parse import unquote, quote, urlparse
-
-# Browser engine: 'selenium' (default) or 'camoufox'
-BROWSER_ENGINE = os.environ.get('BROWSER_ENGINE', 'selenium').lower()
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -177,21 +172,13 @@ def _cmd_request_get(req: V1RequestBase) -> V1ResponseBase:
 def _cmd_request_download(req: V1RequestBase) -> V1ResponseBase:
     """Download a file (e.g. PDF) after solving the Cloudflare challenge.
 
-    Supports two browser engines via BROWSER_ENGINE env var:
-    - 'selenium': undetected-chromedriver + Xvfb (default)
-    - 'camoufox': Camoufox anti-fingerprint browser + playwright-captcha (headless)
+    Uses the same browser session that passed Cloudflare to navigate to the
+    file URL, then intercepts the response body via CDP Fetch API and returns
+    it as base64 in solution.fileBase64.
     """
     if req.url is None:
         raise Exception("Request parameter 'url' is mandatory in 'request.download' command.")
 
-    if BROWSER_ENGINE == 'camoufox':
-        return _cmd_request_download_camoufox(req)
-    else:
-        return _cmd_request_download_selenium(req)
-
-
-def _cmd_request_download_selenium(req: V1RequestBase) -> V1ResponseBase:
-    """Download file using Selenium + undetected-chromedriver engine."""
     timeout = int(req.maxTimeout) / 1000
     driver = None
     try:
@@ -213,40 +200,6 @@ def _cmd_request_download_selenium(req: V1RequestBase) -> V1ResponseBase:
             if utils.PLATFORM_VERSION == "nt":
                 driver.close()
             driver.quit()
-
-
-def _cmd_request_download_camoufox(req: V1RequestBase) -> V1ResponseBase:
-    """Download file using Camoufox + playwright-captcha engine."""
-    try:
-        from camoufox_engine import camoufox_download
-    except ImportError as e:
-        raise Exception(f"Camoufox engine not available: {e}. "
-                        f"Install with: pip install camoufox playwright-captcha && camoufox fetch")
-
-    timeout = int(req.maxTimeout)
-    proxy = None
-    if req.proxy:
-        proxy = req.proxy
-
-    try:
-        result = asyncio.get_event_loop().run_until_complete(
-            camoufox_download(req.url, max_timeout=timeout, proxy=proxy))
-    except Exception as e:
-        raise Exception('Error downloading file with Camoufox. ' + str(e).replace('\n', '\\n'))
-
-    # Build response
-    challenge_res = ChallengeResolutionResultT({})
-    challenge_res.url = result.get('url', req.url)
-    challenge_res.status = 200
-    challenge_res.cookies = result.get('cookies', [])
-    challenge_res.userAgent = result.get('userAgent', '')
-    challenge_res.fileBase64 = result.get('fileBase64')
-
-    res = V1ResponseBase({})
-    res.status = result.get('status', STATUS_OK)
-    res.message = result.get('message', '')
-    res.solution = challenge_res
-    return res
 
 
 def _download_file_logic(req: V1RequestBase, driver: WebDriver) -> V1ResponseBase:
