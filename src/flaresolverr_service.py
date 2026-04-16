@@ -1,10 +1,11 @@
+import base64
 import logging
 import platform
 import sys
 import time
 from datetime import timedelta
 from html import escape
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlparse
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -139,6 +140,8 @@ def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
         res = _cmd_sessions_destroy(req)
     elif req.cmd == 'request.get':
         res = _cmd_request_get(req)
+    elif req.cmd == 'request.download':
+        res = _cmd_request_download(req)
     elif req.cmd == 'request.post':
         res = _cmd_request_post(req)
     else:
@@ -164,6 +167,215 @@ def _cmd_request_get(req: V1RequestBase) -> V1ResponseBase:
     res.message = challenge_res.message
     res.solution = challenge_res.result
     return res
+
+
+def _cmd_request_download(req: V1RequestBase) -> V1ResponseBase:
+    """Download a file (e.g. PDF) after solving the Cloudflare challenge.
+
+    Uses the same browser session that passed Cloudflare to navigate to the
+    file URL, then intercepts the response body via CDP Fetch API and returns
+    it as base64 in solution.fileBase64.
+    """
+    if req.url is None:
+        raise Exception("Request parameter 'url' is mandatory in 'request.download' command.")
+
+    timeout = int(req.maxTimeout) / 1000
+    driver = None
+    try:
+        if req.session:
+            session_id = req.session
+            ttl = timedelta(minutes=req.session_ttl_minutes) if req.session_ttl_minutes else None
+            session, fresh = SESSIONS_STORAGE.get(session_id, ttl)
+            driver = session.driver
+        else:
+            driver = utils.get_webdriver(req.proxy)
+
+        return func_timeout(timeout, _download_file_logic, (req, driver))
+    except FunctionTimedOut:
+        raise Exception(f'Error downloading file. Timeout after {timeout} seconds.')
+    except Exception as e:
+        raise Exception('Error downloading file. ' + str(e).replace('\n', '\\n'))
+    finally:
+        if not req.session and driver is not None:
+            if utils.PLATFORM_VERSION == "nt":
+                driver.close()
+            driver.quit()
+
+
+def _download_file_logic(req: V1RequestBase, driver: WebDriver) -> V1ResponseBase:
+    """Navigate to URL, solve challenge if needed, then download file via CDP."""
+    res = ChallengeResolutionT({})
+    res.status = STATUS_OK
+
+    # Step 1: Navigate and solve challenge (same as _evil_logic)
+    logging.debug(f"Navigating to... {req.url}")
+    driver.get(req.url)
+
+    # Wait for Cloudflare challenge
+    page_title = driver.title
+    challenge_found = any(title.lower() == page_title.lower() for title in CHALLENGE_TITLES)
+
+    if challenge_found:
+        logging.info("Challenge detected for download. Title: " + page_title)
+        attempt = 0
+        while True:
+            try:
+                attempt += 1
+                for title in CHALLENGE_TITLES:
+                    WebDriverWait(driver, SHORT_TIMEOUT).until_not(title_is(title))
+                for selector in CHALLENGE_SELECTORS:
+                    WebDriverWait(driver, SHORT_TIMEOUT).until_not(
+                        presence_of_element_located((By.CSS_SELECTOR, selector)))
+                break
+            except TimeoutException:
+                click_verify(driver)
+                driver.find_element(By.TAG_NAME, "html")
+
+        try:
+            WebDriverWait(driver, SHORT_TIMEOUT).until(
+                staleness_of(driver.find_element(By.TAG_NAME, "html")))
+        except Exception:
+            pass
+        logging.info("Challenge solved for download!")
+
+    # Step 1.5: Wait for non-Cloudflare challenges (AWS WAF, etc.)
+    # Some sites use JS challenges that FlareSolverr doesn't detect by title.
+    # Detect them by checking page source for known patterns, then wait.
+    _wait_start = time.time()
+    _max_challenge_wait = 15  # seconds
+
+    while time.time() - _wait_start < _max_challenge_wait:
+        try:
+            page_source = driver.page_source or ''
+        except Exception:
+            page_source = ''
+
+        # AWS WAF challenge
+        has_waf_challenge = 'awsWafCookieDomainList' in page_source
+        # Generic JS challenge indicators
+        has_js_challenge = ('challenge' in page_source.lower()[:2000]
+                           and len(page_source) < 5000
+                           and '<form' not in page_source.lower()[:2000])
+
+        if has_waf_challenge or has_js_challenge:
+            if time.time() - _wait_start < 1:  # Log only once
+                logging.info(f"JS challenge detected (WAF={has_waf_challenge}), waiting for completion...")
+            time.sleep(1)
+        else:
+            break
+
+    if time.time() - _wait_start >= 2:
+        logging.info(f"JS challenge wait completed in {time.time() - _wait_start:.1f}s")
+
+    # Step 2: Determine the fetch URL.
+    # After navigation, the browser may have been redirected to a CDN domain
+    # (e.g. watermark02.silverchair.com, pdf.sciencedirectassets.com).
+    # Use the current URL (which is same-origin) to avoid CORS issues.
+    current_url = driver.current_url
+    target_origin = f"{urlparse(req.url).scheme}://{urlparse(req.url).netloc}"
+    current_origin = f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}"
+
+    # Detect browser internal URLs (download triggered native file save, tab is empty)
+    is_internal_url = current_url.startswith(('chrome://', 'about:', 'data:'))
+
+    if is_internal_url:
+        # Browser triggered a native download, tab is empty.
+        # Navigate to the target base URL, then JS fetch the original URL.
+        logging.info(f"Native download detected (current={current_url[:40]}), "
+                     f"navigating to {target_origin} for JS fetch...")
+        driver.get(target_origin)
+
+        # Wait for possible Cloudflare challenge on base URL
+        page_title = driver.title
+        if any(title.lower() == page_title.lower() for title in CHALLENGE_TITLES):
+            logging.info("Challenge detected on base URL. Title: " + page_title)
+            attempt = 0
+            while True:
+                try:
+                    attempt += 1
+                    for title in CHALLENGE_TITLES:
+                        WebDriverWait(driver, SHORT_TIMEOUT).until_not(title_is(title))
+                    for selector in CHALLENGE_SELECTORS:
+                        WebDriverWait(driver, SHORT_TIMEOUT).until_not(
+                            presence_of_element_located((By.CSS_SELECTOR, selector)))
+                    break
+                except TimeoutException:
+                    click_verify(driver)
+                    driver.find_element(By.TAG_NAME, "html")
+            try:
+                WebDriverWait(driver, SHORT_TIMEOUT).until(
+                    staleness_of(driver.find_element(By.TAG_NAME, "html")))
+            except Exception:
+                pass
+            logging.info("Challenge solved on base URL!")
+
+        fetch_url = req.url
+    elif current_origin != target_origin:
+        # Redirected to CDN domain, fetch from there (same-origin)
+        fetch_url = current_url
+        logging.info(f"Redirected to {current_origin}, will fetch: {fetch_url[:80]}")
+    else:
+        fetch_url = req.url
+
+    # Step 3: Download file via JS fetch in the browser context.
+    # The browser is on the same origin as fetch_url, so no CORS issues.
+    file_base64 = None
+
+    logging.info("Downloading file via JS fetch in browser context...")
+    try:
+        js_result = driver.execute_async_script("""
+            var url = arguments[0];
+            var callback = arguments[arguments.length - 1];
+            fetch(url)
+                .then(r => {
+                    if (!r.ok) {
+                        callback({error: 'HTTP ' + r.status + ' ' + r.statusText});
+                        return;
+                    }
+                    return r.blob();
+                })
+                .then(blob => {
+                    if (!blob) return;
+                    var reader = new FileReader();
+                    reader.onloadend = () => callback({
+                        data: reader.result.split(',')[1],
+                        size: blob.size,
+                        type: blob.type
+                    });
+                    reader.onerror = () => callback({error: 'FileReader error'});
+                    reader.readAsDataURL(blob);
+                })
+                .catch(e => callback({error: e.toString()}));
+        """, fetch_url)
+
+        if isinstance(js_result, dict):
+            if 'error' in js_result:
+                raise Exception(f"JS fetch error: {js_result['error']}")
+            if 'data' in js_result:
+                file_base64 = js_result['data']
+                logging.info(f"JS fetch success: {js_result.get('size', '?')} bytes, "
+                             f"type: {js_result.get('type', '?')}")
+    except Exception as e:
+        logging.error(f"JS fetch failed: {e}")
+
+    if file_base64 is None:
+        raise Exception("Failed to download file content")
+
+    # Build response
+    challenge_res = ChallengeResolutionResultT({})
+    challenge_res.url = current_url
+    challenge_res.status = 200
+    challenge_res.cookies = driver.get_cookies()
+    challenge_res.userAgent = utils.get_user_agent(driver)
+    challenge_res.fileBase64 = file_base64
+    res.message = "File downloaded successfully"
+    res.result = challenge_res
+
+    v1_res = V1ResponseBase({})
+    v1_res.status = res.status
+    v1_res.message = res.message
+    v1_res.solution = res.result
+    return v1_res
 
 
 def _cmd_request_post(req: V1RequestBase) -> V1ResponseBase:

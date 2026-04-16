@@ -12,6 +12,7 @@ class ChallengeResolutionResultT:
     userAgent: str = None
     screenshot: str | None = None
     turnstile_token: str = None
+    fileBase64: str | None = None  # base64 encoded file content for request.download
 
     def __init__(self, _dict):
         self.__dict__.update(_dict)
