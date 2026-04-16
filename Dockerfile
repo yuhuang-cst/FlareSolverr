@@ -51,7 +51,15 @@ RUN pip install -r requirements.txt \
     # Remove temporary files
     && rm -rf /root/.cache
 
+# Install Camoufox engine (optional, enabled via BROWSER_ENGINE=camoufox)
+RUN pip install camoufox playwright-captcha \
+    && rm -rf /root/.cache \
+    || echo "Camoufox installation skipped (optional)"
+
 USER flaresolverr
+
+# Fetch Camoufox browser binary (optional)
+RUN camoufox fetch || echo "Camoufox fetch skipped (optional)"
 
 RUN mkdir -p "/app/.config/chromium/Crash Reports/pending"
 
